@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# env
+.env
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# data (不要上传数据集)
+data/uploads/
+data/*.jsonl
+
+# outputs
+outputs/
+logs/
+
+# IDE
+.vscode/
+.idea/
