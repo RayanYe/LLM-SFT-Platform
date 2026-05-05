@@ -1,87 +1,179 @@
-# 🤖 LLM-SFT-Platform
+# 🤖 LLM Fine-tuning Platform
 
-> A minimal yet extensible visual platform for fine-tuning large
-> language models (LLMs) with an intuitive UI.
+A full-stack platform for dataset processing, model fine-tuning, evaluation, and interactive analysis using Large Language Models (LLMs).
 
-------------------------------------------------------------------------
+---
 
 ## 📌 Overview
 
-LLM-SFT-Platform is a lightweight end-to-end system that enables users
-to:
+This project provides an end-to-end workflow for:
 
--   Upload and validate datasets\
--   Configure fine-tuning parameters\
--   Launch training jobs with a single click\
--   Monitor training progress in real time\
--   Interact with fine-tuned models
+* Uploading and validating datasets
+* Automatically splitting datasets into train/validation/test
+* Fine-tuning LLMs (LoRA / QLoRA / full)
+* Monitoring training progress
+* Evaluating model performance
+* Interacting with an AI assistant for analysis and suggestions
 
-This project is designed to **lower the barrier of LLM fine-tuning**,
-especially for users without deep ML engineering experience.
+It is designed to be **reproducible, modular, and easy to run**.
 
-------------------------------------------------------------------------
+---
 
-## 🚀 Features
+## 🧱 Project Structure
 
-### 📂 Dataset Management
+```
+.
+├── backend/              # FastAPI backend
+│   ├── app.py
+│   └── core/
+│       └── trainer.py
+├── frontend/             # Streamlit UI
+│   └── streamlit_app.py
+├── script/               # Utility scripts
+│   └── download_assistant_model.py
+├── data/                 # Dataset storage (ignored in Git)
+├── models_cache/         # Local model cache (ignored in Git)
+├── outputs/              # Training outputs (ignored)
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
 
--   Upload `.jsonl` datasets via UI
--   Automatic validation
+---
 
-### ⚙️ Training Configuration
+## ⚙️ Installation
 
--   Select base model (Qwen / LLaMA / Mistral)
--   Adjustable hyperparameters
+### 1. Clone the repository
 
-### 📊 Monitoring Dashboard
+```bash
+git clone <your-repo-url>
+cd <repo-name>
+```
 
--   Real-time training status
--   Loss curve visualization
+### 2. Create environment
 
-### 💬 Inference Interface
+```bash
+python -m venv venv
+source venv/bin/activate   # Mac/Linux
+```
 
--   Prompt input panel
--   Output display (placeholder)
+### 3. Install dependencies
 
-------------------------------------------------------------------------
-
-## 🏗️ Architecture
-
-Frontend (Streamlit) → Backend (FastAPI) → Training Engine
-
-------------------------------------------------------------------------
-
-## 📁 Project Structure
-
-LLM-SFT-Platform/ ├── backend/ ├── frontend/ ├── data/ ├── outputs/ ├──
-requirements.txt └── README.md
-
-------------------------------------------------------------------------
-
-## ⚡ Getting Started
-
-### Install dependencies
-
+```bash
 pip install -r requirements.txt
+```
 
-### Run backend
+---
 
+## 🤖 Model Setup
+
+This project uses a local assistant model:
+
+**Default model:** `Qwen/Qwen2.5-0.5B-Instruct`
+
+### Option 1: Automatic download (recommended)
+
+```bash
+python script/download_assistant_model.py
+```
+
+The model will be stored in:
+
+```
+models_cache/
+```
+
+### Option 2: Use existing local model
+
+Set environment variable:
+
+```bash
+export ASSISTANT_MODEL_PATH="/your/local/model/path"
+```
+
+---
+
+## 🚀 Running the Project
+
+### 1. Start backend (FastAPI)
+
+```bash
 uvicorn backend.app:app --reload
+```
 
-### Run frontend
+Backend runs at:
 
+```
+http://127.0.0.1:8000
+```
+
+---
+
+### 2. Start frontend (Streamlit)
+
+```bash
 streamlit run frontend/streamlit_app.py
+```
 
-------------------------------------------------------------------------
+Frontend runs at:
 
-## 📄 Dataset Format
+```
+http://localhost:8501
+```
 
-Each line must be JSON:
+---
 
-{"instruction": "...", "input": "...", "output": "..."}
+## 🔄 Workflow
 
-------------------------------------------------------------------------
+1. Upload dataset (CSV / JSON / JSONL)
+2. System validates and splits data automatically
+3. Configure training parameters
+4. Start fine-tuning
+5. Monitor training progress
+6. Evaluate model performance
+7. Use AI assistant for insights
 
-## 👤 Author
+---
 
-Rayan Ye
+## 📊 Features
+
+* ✅ Dataset validation and normalization
+* ✅ Automatic train/validation/test split
+* ✅ LoRA / QLoRA / full fine-tuning
+* ✅ Training monitoring (loss curves)
+* ✅ Evaluation metrics (accuracy, token-level)
+* ✅ Error analysis with examples
+* ✅ AI assistant for evaluation insights
+
+---
+
+## ⚠️ Notes
+
+* `models_cache/`, `data/`, and `outputs/` are **not included in GitHub**
+* Models will be downloaded automatically if not found locally
+* Some models (e.g., LLaMA) may require Hugging Face access
+
+---
+
+## 🧠 Reproducibility
+
+The system ensures reproducibility by:
+
+* Using deterministic seeds
+* Supporting local + remote model loading
+* Providing a model download script
+
+---
+
+## 📌 Tech Stack
+
+* Backend: FastAPI
+* Frontend: Streamlit
+* ML: PyTorch, Transformers, PEFT
+* Dataset: HuggingFace Datasets
+
+---
+
+## 📬 Contact
+
+For questions or issues, please open an issue or contact the author.

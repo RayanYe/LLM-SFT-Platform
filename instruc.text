@@ -1,2 +1,0 @@
-uvicorn backend.app:app --reload
-streamlit run app.py

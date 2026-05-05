@@ -2,347 +2,1152 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+try:
+    from huggingface_hub import snapshot_download
+except Exception:  # pragma: no cover
+    snapshot_download = None  # type: ignore
+# ------------------------------------------------------------
+# Environment
+# ------------------------------------------------------------
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+# ------------------------------------------------------------
+# Project paths
+# ------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CACHE_DIR = PROJECT_ROOT / "models_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------
-# Data models
-# ----------------------------
+# 你的本地 Qwen2.5-0.5B-Instruct snapshot 目录
+# 例如：
+# /root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be...
+ASSISTANT_MODEL_ID = os.environ.get(
+    "ASSISTANT_MODEL_ID",
+    "Qwen/Qwen2.5-0.5B-Instruct",
+)
 
+ASSISTANT_MODEL_PATH = os.environ.get(
+    "ASSISTANT_MODEL_PATH",
+    str(CACHE_DIR / "models--Qwen--Qwen2.5-0.5B-Instruct")
+)
+# ------------------------------------------------------------
+# Optional ML stack
+# ------------------------------------------------------------
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
+
+try:
+    from datasets import Dataset
+except Exception:  # pragma: no cover
+    Dataset = None  # type: ignore
+
+try:
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        DataCollatorForLanguageModeling,
+        Trainer,
+        TrainingArguments,
+        TrainerCallback,
+        set_seed,
+        BitsAndBytesConfig,
+    )
+except Exception:  # pragma: no cover
+    AutoModelForCausalLM = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+    DataCollatorForLanguageModeling = None  # type: ignore
+    Trainer = None  # type: ignore
+    TrainingArguments = None  # type: ignore
+    TrainerCallback = object  # type: ignore
+    set_seed = None  # type: ignore
+    BitsAndBytesConfig = None  # type: ignore
+
+try:
+    from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+except Exception:  # pragma: no cover
+    LoraConfig = None  # type: ignore
+    TaskType = None  # type: ignore
+    get_peft_model = None  # type: ignore
+    PeftModel = None  # type: ignore
+
+REQUIRED_COLUMNS = ["instruction", "input", "output"]
+
+MODEL_ALIASES = {
+    "Qwen2.5-0.5B": "Qwen/Qwen2.5-0.5B",
+    "Qwen2.5-0.5B-Instruct": "Qwen/Qwen2.5-0.5B-Instruct",
+    "Qwen2.5-1.5B": "Qwen/Qwen2.5-1.5B",
+    "Qwen2.5-1.5B-Instruct": "Qwen/Qwen2.5-1.5B-Instruct",
+    "Qwen2.5-3B": "Qwen/Qwen2.5-3B",
+    "Qwen2.5-3B-Instruct": "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen2.5-7B": "Qwen/Qwen2.5-7B",
+    "Qwen2.5-7B-Instruct": "Qwen/Qwen2.5-7B-Instruct",
+    "Llama-3.1-8B": "meta-llama/Llama-3.1-8B",
+    "Llama-3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "Mistral-7B": "mistralai/Mistral-7B-v0.1",
+    "Mistral-7B-Instruct": "mistralai/Mistral-7B-Instruct-v0.3",
+    "Mixtral-8x7B": "mistralai/Mixtral-8x7B-v0.1",
+    "Mixtral-8x22B": "mistralai/Mixtral-8x22B-v0.1",
+    "Phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
+    "ChatGLM3-6B": "THUDM/chatglm3-6b",
+    "InternLM2-7B": "internlm/internlm2-7b",
+    "Baichuan2-7B": "baichuan-inc/Baichuan2-7B-Base",
+}
+
+# ------------------------------------------------------------
+# Dataclasses
+# ------------------------------------------------------------
 @dataclass
 class TrainConfig:
     base_model: str
     dataset_path: str
-    finetune_method: str
-    output_dir: str
+    finetune_method: str = "LoRA"  # LoRA | QLoRA | Full Fine-tuning
+    output_dir: str = "./outputs/finetuned_model"
+
     learning_rate: float = 2e-4
     batch_size: int = 4
     epochs: int = 3
     lora_rank: int = 8
     max_length: int = 512
 
+    seed: int = 42
+    warmup_ratio: float = 0.03
+    weight_decay: float = 0.0
+    logging_steps: int = 1
+    eval_split_ratio: float = 0.1
+
 
 @dataclass
-class TrainingResult:
+class TrainResult:
     success: bool
     message: str
-    output_dir: str
-    log_path: Optional[str] = None
-    metrics_path: Optional[str] = None
-    checkpoint_dir: Optional[str] = None
-    loss_history: Optional[List[Dict[str, float]]] = None
+    output_dir: str = ""
+    model_name: str = ""
+    finetune_method: str = ""
+    num_train_samples: int = 0
+    num_eval_samples: int = 0
+    loss_history: List[Dict[str, Any]] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+    note: str = ""
 
 
-# ----------------------------
-# 1) Validate dataset
-# ----------------------------
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def _ensure_dependencies() -> None:
+    if torch is None or Dataset is None or Trainer is None or TrainingArguments is None:
+        raise RuntimeError(
+            "Missing required ML dependencies. Please install torch, datasets, transformers."
+        )
 
-def validate_dataset(file_path: str) -> Dict[str, Any]:
+
+def detect_device() -> tuple[Any, Any, str]:
+    if torch is None:
+        return None, None, "cpu"
+    if torch.cuda.is_available():
+        return torch.device("cuda"), torch.float16, "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps"), torch.float16, "mps"
+    return torch.device("cpu"), torch.float32, "cpu"
+
+
+def normalize_model_name(name: str) -> str:
+    candidate = Path(name)
+    if candidate.exists():
+        return str(candidate)
+    return MODEL_ALIASES.get(name, name)
+
+
+def resolve_local_model_path(path_str: str) -> str:
     """
-    Validate a JSONL dataset for fine-tuning.
+    Accept either:
+    1) actual snapshot folder with config.json / model.safetensors
+    2) a parent folder containing snapshots/<hash>/...
+    3) a normal HF model id
+    """
+    if not path_str:
+        return path_str
 
-    Expected format per line:
-    {
-        "instruction": "...",
-        "input": "...",
-        "output": "..."
+    p = Path(path_str)
+    if not p.exists():
+        return path_str
+
+    if p.is_file():
+        return str(p)
+
+    if (p / "config.json").exists():
+        return str(p)
+
+    snapshots = p / "snapshots"
+    if snapshots.exists() and snapshots.is_dir():
+        for child in sorted(snapshots.iterdir()):
+            if child.is_dir() and (child / "config.json").exists():
+                return str(child)
+
+    return str(p)
+
+
+def _safe_mkdir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not path.exists():
+        return records
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSONL parse failed at line {line_no}: {e}") from e
+            if not isinstance(obj, dict):
+                raise ValueError(f"JSONL line {line_no} must be an object.")
+            records.append(obj)
+    return records
+
+
+def _sample_keys(records: List[Dict[str, Any]]) -> List[str]:
+    keys = set()
+    for item in records:
+        keys.update(item.keys())
+    return sorted(keys)
+
+
+def _validate_record(record: Dict[str, Any], idx: int) -> None:
+    missing = [k for k in REQUIRED_COLUMNS if k not in record]
+    if missing:
+        raise ValueError(f"Sample {idx} is missing fields: {', '.join(missing)}")
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _format_sft_text(example: Dict[str, Any]) -> str:
+    instruction = _normalize_text(example.get("instruction"))
+    input_text = _normalize_text(example.get("input"))
+    output_text = _normalize_text(example.get("output"))
+
+    if input_text:
+        prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n"
+    else:
+        prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
+
+    return prompt + output_text
+
+
+def _guess_lora_target_modules(model_name: str) -> List[str]:
+    name = model_name.lower()
+    if any(x in name for x in ["qwen", "llama", "mistral", "gemma", "phi", "yi", "glm", "internlm", "baichuan"]):
+        return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    return ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+
+def _normalize_metric_text(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _tokenize_for_metric(text: str) -> List[str]:
+    text = _normalize_metric_text(text)
+    if not text:
+        return []
+    if re.search(r"\s", text):
+        return text.split()
+    return list(text)
+
+
+def _exact_match(reference: str, prediction: str) -> bool:
+    return _normalize_metric_text(reference) == _normalize_metric_text(prediction)
+
+
+def _token_accuracy(reference: str, prediction: str) -> float:
+    ref_tokens = _tokenize_for_metric(reference)
+    pred_tokens = _tokenize_for_metric(prediction)
+
+    denom = max(len(ref_tokens), len(pred_tokens), 1)
+    matches = 0
+    for i in range(min(len(ref_tokens), len(pred_tokens))):
+        if ref_tokens[i] == pred_tokens[i]:
+            matches += 1
+    return matches / denom
+
+
+def build_generation_prompt(instruction: str, input_text: str = "", template: str = "alpaca") -> str:
+    instruction = _normalize_text(instruction)
+    input_text = _normalize_text(input_text)
+
+    if template.lower() in {"alpaca", "qwen", "llama2", "chatml"}:
+        if input_text:
+            return f"Instruction: {instruction}\nInput: {input_text}\nResponse:"
+        return f"Instruction: {instruction}\nResponse:"
+
+    if input_text:
+        return f"{instruction}\n\n{input_text}\n\nAnswer:"
+    return f"{instruction}\n\nAnswer:"
+
+
+def build_chat_messages_from_context(
+    question: str,
+    evaluation_context: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    summary = {
+        "metrics": evaluation_context.get("metrics", {}),
+        "examples": evaluation_context.get("examples", [])[:3],
+        "generation_config": evaluation_context.get("generation_config", {}),
+        "model": evaluation_context.get("model", {}),
+        "split_name": evaluation_context.get("split_name", ""),
+        "message": evaluation_context.get("message", ""),
     }
 
-    Returns:
-        {
-            "valid": bool,
-            "message": str,
-            "num_samples": int,
-            "sample_keys": list[str]
-        }
-    """
-    path = Path(file_path)
+    system_prompt = (
+        "You are an expert AI assistant for LLM fine-tuning evaluation.\n"
+        "Your job is to analyze evaluation results, explain likely causes of errors, "
+        "and give practical next-step suggestions.\n"
+        "Be concise, specific, and actionable.\n"
+        "When metrics are weak, suggest changes to data, prompt template, decoding params, or training settings."
+    )
 
+    user_prompt = (
+        f"Evaluation context:\n{json.dumps(summary, ensure_ascii=False, indent=2)}\n\n"
+        f"User question:\n{question}"
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+# ------------------------------------------------------------
+# Validation / config
+# ------------------------------------------------------------
+def validate_dataset(dataset_path: str) -> Dict[str, Any]:
+    path = Path(dataset_path)
     if not path.exists():
         return {
             "valid": False,
-            "message": f"Dataset file does not exist: {file_path}",
+            "message": f"Dataset not found: {dataset_path}",
             "num_samples": 0,
-            "sample_keys": []
+            "sample_keys": [],
+            "preview": [],
         }
 
     if path.suffix.lower() != ".jsonl":
         return {
             "valid": False,
-            "message": "Only .jsonl dataset format is supported in the MVP.",
+            "message": "Dataset must be a .jsonl file after backend normalization.",
             "num_samples": 0,
-            "sample_keys": []
+            "sample_keys": [],
+            "preview": [],
         }
 
-    required_fields = {"instruction", "input", "output"}
-    num_samples = 0
-    sample_keys: List[str] = []
-
     try:
-        with path.open("r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f, start=1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-
-                try:
-                    item = json.loads(stripped)
-                except json.JSONDecodeError as e:
-                    return {
-                        "valid": False,
-                        "message": f"Invalid JSON on line {line_no}: {e}",
-                        "num_samples": num_samples,
-                        "sample_keys": sample_keys
-                    }
-
-                if not isinstance(item, dict):
-                    return {
-                        "valid": False,
-                        "message": f"Line {line_no} is not a JSON object.",
-                        "num_samples": num_samples,
-                        "sample_keys": sample_keys
-                    }
-
-                if num_samples == 0:
-                    sample_keys = sorted(list(item.keys()))
-
-                missing = required_fields - set(item.keys())
-                if missing:
-                    return {
-                        "valid": False,
-                        "message": f"Missing required fields on line {line_no}: {sorted(list(missing))}",
-                        "num_samples": num_samples,
-                        "sample_keys": sample_keys
-                    }
-
-                num_samples += 1
-
+        records = _read_jsonl(path)
     except Exception as e:
         return {
             "valid": False,
-            "message": f"Failed to read dataset: {e}",
-            "num_samples": num_samples,
-            "sample_keys": sample_keys
+            "message": str(e),
+            "num_samples": 0,
+            "sample_keys": [],
+            "preview": [],
         }
 
-    if num_samples == 0:
+    if not records:
         return {
             "valid": False,
             "message": "Dataset is empty.",
             "num_samples": 0,
-            "sample_keys": []
+            "sample_keys": [],
+            "preview": [],
+        }
+
+    try:
+        for idx, rec in enumerate(records, start=1):
+            _validate_record(rec, idx)
+    except Exception as e:
+        return {
+            "valid": False,
+            "message": str(e),
+            "num_samples": len(records),
+            "sample_keys": _sample_keys(records),
+            "preview": records[:3],
         }
 
     return {
         "valid": True,
-        "message": "Dataset validation passed.",
-        "num_samples": num_samples,
-        "sample_keys": sample_keys
+        "message": f"Dataset valid with {len(records)} samples.",
+        "num_samples": len(records),
+        "sample_keys": _sample_keys(records),
+        "preview": records[:3],
     }
 
 
-# ----------------------------
-# 2) Build train config
-# ----------------------------
+def build_train_config(payload: Dict[str, Any]) -> TrainConfig:
+    required = ["base_model", "dataset_path"]
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
 
-def build_train_config(form_data: Dict[str, Any]) -> TrainConfig:
-    """
-    Convert UI form data into a typed training config.
-    This function also applies basic defaults and validation.
-    """
-    base_model = str(form_data.get("base_model", "")).strip()
-    dataset_path = str(form_data.get("dataset_path", "")).strip()
-    finetune_method = str(form_data.get("finetune_method", "LoRA")).strip()
-    output_dir = str(form_data.get("output_dir", "./outputs/finetuned_model")).strip()
+    finetune_method = str(payload.get("finetune_method", "LoRA")).strip()
+    if finetune_method not in {"LoRA", "QLoRA", "Full Fine-tuning"}:
+        raise ValueError("finetune_method must be one of: LoRA, QLoRA, Full Fine-tuning")
 
-    if not base_model:
-        raise ValueError("base_model is required.")
-    if not dataset_path:
-        raise ValueError("dataset_path is required.")
-    if not output_dir:
-        raise ValueError("output_dir is required.")
+    dataset_path = Path(str(payload["dataset_path"]))
+    if not dataset_path.exists():
+        raise ValueError(f"Dataset path does not exist: {dataset_path}")
 
-    learning_rate = float(form_data.get("learning_rate", 2e-4))
-    batch_size = int(form_data.get("batch_size", 4))
-    epochs = int(form_data.get("epochs", 3))
-    lora_rank = int(form_data.get("lora_rank", 8))
-    max_length = int(form_data.get("max_length", 512))
+    output_dir = str(payload.get("output_dir", "./outputs/finetuned_model"))
+    _safe_mkdir(Path(output_dir))
 
-    if learning_rate <= 0:
-        raise ValueError("learning_rate must be > 0.")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be > 0.")
-    if epochs <= 0:
-        raise ValueError("epochs must be > 0.")
-    if lora_rank <= 0:
-        raise ValueError("lora_rank must be > 0.")
-    if max_length <= 0:
-        raise ValueError("max_length must be > 0.")
+    normalized_model = normalize_model_name(str(payload["base_model"]))
 
     return TrainConfig(
-        base_model=base_model,
-        dataset_path=dataset_path,
+        base_model=normalized_model,
+        dataset_path=str(dataset_path),
         finetune_method=finetune_method,
         output_dir=output_dir,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        epochs=epochs,
-        lora_rank=lora_rank,
-        max_length=max_length,
+        learning_rate=float(payload.get("learning_rate", 2e-4)),
+        batch_size=int(payload.get("batch_size", 4)),
+        epochs=int(payload.get("epochs", 3)),
+        lora_rank=int(payload.get("lora_rank", 8)),
+        max_length=int(payload.get("max_length", 512)),
+        seed=int(payload.get("seed", 42)),
+        warmup_ratio=float(payload.get("warmup_ratio", 0.03)),
+        weight_decay=float(payload.get("weight_decay", 0.0)),
+        logging_steps=int(payload.get("logging_steps", 1)),
+        eval_split_ratio=float(payload.get("eval_split_ratio", 0.1)),
     )
 
 
-# ----------------------------
-# 3) Start training
-# ----------------------------
+# ------------------------------------------------------------
+# Dataset / assistant loading
+# ------------------------------------------------------------
+def _load_model_and_tokenizer(config: TrainConfig):
+    _ensure_dependencies()
 
-def start_training(config: TrainConfig) -> TrainingResult:
-    """
-    Start training workflow.
+    if AutoTokenizer is None or AutoModelForCausalLM is None:
+        raise RuntimeError("transformers is not available.")
 
-    Current version is a mock training loop:
-    - creates output dirs
-    - writes logs/metrics
-    - simulates loss decrease
+    device, dtype, device_name = detect_device()
+    model_id = normalize_model_name(config.base_model)
 
-    Later you can replace the inner loop with:
-    - Transformers + PEFT training
-    - subprocess call to a real train script
-    """
-    output_dir = Path(config.output_dir)
-    log_dir = output_dir / "logs"
-    ckpt_dir = output_dir / "checkpoints"
-    metrics_dir = output_dir / "metrics"
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id,
+        cache_dir=str(CACHE_DIR),
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
-    log_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    metrics_dir.mkdir(parents=True, exist_ok=True)
+    effective_method = config.finetune_method
+    use_cuda = device_name == "cuda"
 
-    log_path = log_dir / "train.log"
-    metrics_path = metrics_dir / "metrics.json"
+    if effective_method == "QLoRA" and not use_cuda:
+        effective_method = "LoRA"
 
-    # Re-validate dataset before training
-    dataset_check = validate_dataset(config.dataset_path)
-    if not dataset_check["valid"]:
-        return TrainingResult(
-            success=False,
-            message=f"Training aborted: {dataset_check['message']}",
-            output_dir=str(output_dir),
-            log_path=str(log_path),
-            metrics_path=str(metrics_path),
-            checkpoint_dir=str(ckpt_dir),
-            loss_history=[],
+    if effective_method == "QLoRA":
+        if get_peft_model is None or LoraConfig is None or TaskType is None:
+            raise RuntimeError("peft is required for QLoRA.")
+        if BitsAndBytesConfig is None:
+            raise RuntimeError("bitsandbytes / BitsAndBytesConfig is required for QLoRA.")
+
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=dtype,
         )
 
-    loss_history: List[Dict[str, float]] = []
-    global_step = 0
-
-    try:
-        with log_path.open("w", encoding="utf-8") as log_f:
-            log_f.write("=== Training Started ===\n")
-            log_f.write(f"Config: {json.dumps(asdict(config), ensure_ascii=False, indent=2)}\n")
-            log_f.write(f"Dataset samples: {dataset_check['num_samples']}\n\n")
-
-            for epoch in range(1, config.epochs + 1):
-                log_f.write(f"[Epoch {epoch}/{config.epochs}] started\n")
-                log_f.flush()
-
-                # Simulate a fixed number of steps per epoch
-                steps_per_epoch = max(5, min(20, dataset_check["num_samples"]))
-                for step in range(1, steps_per_epoch + 1):
-                    global_step += 1
-
-                    # Mock loss curve
-                    loss = max(0.05, 2.0 * (0.92 ** global_step))
-                    loss_history.append(
-                        {
-                            "step": float(global_step),
-                            "epoch": float(epoch),
-                            "loss": float(loss),
-                        }
-                    )
-
-                    log_f.write(
-                        f"Epoch {epoch}/{config.epochs} | Step {step}/{steps_per_epoch} | "
-                        f"global_step={global_step} | loss={loss:.4f}\n"
-                    )
-                    log_f.flush()
-
-                    time.sleep(0.05)  # mock training latency
-
-                # Simulate checkpoint saving
-                epoch_ckpt = ckpt_dir / f"epoch_{epoch}"
-                epoch_ckpt.mkdir(parents=True, exist_ok=True)
-                with (epoch_ckpt / "model.txt").open("w", encoding="utf-8") as ckpt_f:
-                    ckpt_f.write(f"Mock checkpoint for epoch {epoch}\n")
-                    ckpt_f.write(f"base_model={config.base_model}\n")
-
-                log_f.write(f"[Epoch {epoch}/{config.epochs}] completed\n\n")
-                log_f.flush()
-
-            log_f.write("=== Training Finished Successfully ===\n")
-
-        with metrics_path.open("w", encoding="utf-8") as metrics_f:
-            json.dump(
-                {
-                    "config": asdict(config),
-                    "dataset": dataset_check,
-                    "loss_history": loss_history,
-                    "final_loss": loss_history[-1]["loss"] if loss_history else None,
-                },
-                metrics_f,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-        return TrainingResult(
-            success=True,
-            message="Training completed successfully.",
-            output_dir=str(output_dir),
-            log_path=str(log_path),
-            metrics_path=str(metrics_path),
-            checkpoint_dir=str(ckpt_dir),
-            loss_history=loss_history,
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            cache_dir=str(CACHE_DIR),
+            trust_remote_code=True,
+            quantization_config=quant_config,
+            device_map="auto",
         )
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
 
-    except Exception as e:
-        # Best-effort error logging
+        lora_targets = _guess_lora_target_modules(model_id)
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=max(config.lora_rank * 2, 8),
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=lora_targets,
+        )
+        model = get_peft_model(model, lora_config)
+        return model, tokenizer, effective_method, device_name
+
+    if effective_method == "LoRA":
+        if get_peft_model is None or LoraConfig is None or TaskType is None:
+            raise RuntimeError("peft is required for LoRA.")
+
+        load_kwargs: Dict[str, Any] = {
+            "cache_dir": str(CACHE_DIR),
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
+        if device_name in {"cuda", "mps"} and dtype is not None:
+            load_kwargs["torch_dtype"] = dtype
+
+        model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+        model.config.use_cache = False
+
+        if device is not None:
+            model.to(device)
+
         try:
-            with log_path.open("a", encoding="utf-8") as log_f:
-                log_f.write(f"\n[ERROR] Training failed: {e}\n")
+            model.gradient_checkpointing_enable()
         except Exception:
             pass
 
-        return TrainingResult(
+        lora_targets = _guess_lora_target_modules(model_id)
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=max(config.lora_rank * 2, 8),
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=lora_targets,
+        )
+        model = get_peft_model(model, lora_config)
+        return model, tokenizer, effective_method, device_name
+
+    load_kwargs = {
+        "cache_dir": str(CACHE_DIR),
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if device_name in {"cuda", "mps"} and dtype is not None:
+        load_kwargs["torch_dtype"] = dtype
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    model.config.use_cache = False
+
+    if device is not None:
+        model.to(device)
+
+    try:
+        model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+
+    return model, tokenizer, effective_method, device_name
+
+
+def _prepare_datasets(
+    records: List[Dict[str, Any]],
+    tokenizer,
+    max_length: int,
+    seed: int,
+    eval_split_ratio: float,
+):
+    if Dataset is None:
+        raise RuntimeError("datasets is not available.")
+
+    texts = [_format_sft_text(r) for r in records]
+    raw_ds = Dataset.from_dict({"text": texts})
+
+    if len(raw_ds) <= 1:
+        train_ds = raw_ds
+        eval_ds = None
+        return train_ds, eval_ds
+
+    test_size = max(min(eval_split_ratio, 0.3), 0.05)
+    split = raw_ds.train_test_split(test_size=test_size, seed=seed, shuffle=True)
+    train_ds = split["train"]
+    eval_ds = split["test"]
+
+    def tokenize_fn(batch):
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=max_length,
+            padding=False,
+        )
+
+    train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=["text"])
+    if eval_ds is not None:
+        eval_ds = eval_ds.map(tokenize_fn, batched=True, remove_columns=["text"])
+
+    return train_ds, eval_ds
+
+
+class LossHistoryCallback(TrainerCallback):
+    def __init__(self) -> None:
+        self.loss_history: List[Dict[str, Any]] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+        if not logs:
+            return
+        if "loss" in logs:
+            try:
+                loss_value = float(logs["loss"])
+            except Exception:
+                return
+            self.loss_history.append({"step": int(state.global_step), "loss": loss_value})
+
+
+# ------------------------------------------------------------
+# Mock fallback
+# ------------------------------------------------------------
+def _mock_training(config: TrainConfig, reason: str) -> TrainResult:
+    loss_history: List[Dict[str, Any]] = []
+    loss = 1.2
+    steps = max(3, config.epochs * 4)
+
+    for step in range(1, steps + 1):
+        loss = max(0.05, loss * random.uniform(0.80, 0.95))
+        loss_history.append({"step": step, "loss": round(loss, 4)})
+        time.sleep(0.15)
+
+    return TrainResult(
+        success=True,
+        message="Mock training completed.",
+        output_dir=config.output_dir,
+        model_name=config.base_model,
+        finetune_method=config.finetune_method,
+        num_train_samples=0,
+        num_eval_samples=0,
+        loss_history=loss_history,
+        metrics={
+            "train_runtime": round(steps * 0.15, 2),
+            "final_loss": loss_history[-1]["loss"] if loss_history else None,
+        },
+        note=f"Mock mode used: {reason}",
+    )
+
+
+# ------------------------------------------------------------
+# Main training entry
+# ------------------------------------------------------------
+def start_training(config: TrainConfig) -> TrainResult:
+    try:
+        if set_seed is not None:
+            set_seed(config.seed)
+
+        if torch is not None:
+            torch.manual_seed(config.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(config.seed)
+
+        dataset_path = Path(config.dataset_path)
+        records = _read_jsonl(dataset_path)
+        if not records:
+            return TrainResult(
+                success=False,
+                message="Training dataset is empty.",
+                output_dir=config.output_dir,
+                model_name=config.base_model,
+                finetune_method=config.finetune_method,
+            )
+
+        for idx, rec in enumerate(records, start=1):
+            _validate_record(rec, idx)
+
+        if torch is None or Dataset is None or Trainer is None or TrainingArguments is None:
+            return _mock_training(config, "Missing torch/datasets/transformers")
+
+        model, tokenizer, effective_method, device_name = _load_model_and_tokenizer(config)
+
+        train_ds, eval_ds = _prepare_datasets(
+            records=records,
+            tokenizer=tokenizer,
+            max_length=config.max_length,
+            seed=config.seed,
+            eval_split_ratio=config.eval_split_ratio,
+        )
+
+        if DataCollatorForLanguageModeling is None:
+            return _mock_training(config, "DataCollatorForLanguageModeling unavailable")
+
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+        loss_callback = LossHistoryCallback()
+
+        use_cuda = device_name == "cuda"
+        fp16 = bool(use_cuda)
+        bf16 = False
+
+        optim = "adamw_torch"
+        if effective_method == "QLoRA" and use_cuda:
+            optim = "paged_adamw_8bit"
+
+        training_args = TrainingArguments(
+            output_dir=config.output_dir,
+            overwrite_output_dir=True,
+            num_train_epochs=config.epochs,
+            per_device_train_batch_size=config.batch_size,
+            per_device_eval_batch_size=config.batch_size,
+            learning_rate=config.learning_rate,
+            warmup_ratio=config.warmup_ratio,
+            weight_decay=config.weight_decay,
+            logging_steps=max(config.logging_steps, 1),
+            save_strategy="epoch",
+            eval_strategy="epoch" if eval_ds is not None and len(eval_ds) > 0 else "no",
+            report_to=[],
+            fp16=fp16,
+            bf16=bf16,
+            optim=optim,
+            remove_unused_columns=False,
+            dataloader_pin_memory=use_cuda,
+            seed=config.seed,
+            save_total_limit=2,
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=eval_ds if eval_ds is not None and len(eval_ds) > 0 else None,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            callbacks=[loss_callback],
+        )
+
+        train_start = time.time()
+        train_output = trainer.train()
+        train_runtime = time.time() - train_start
+
+        out_dir = Path(config.output_dir)
+        _safe_mkdir(out_dir)
+
+        trainer.save_model(str(out_dir))
+        tokenizer.save_pretrained(str(out_dir))
+
+        metrics = {
+            "train_runtime": round(train_runtime, 2),
+            "train_samples": len(train_ds),
+            "eval_samples": len(eval_ds) if eval_ds is not None else 0,
+            "device": device_name,
+            "effective_method": effective_method,
+        }
+
+        try:
+            train_metrics = train_output.metrics or {}
+            for k, v in train_metrics.items():
+                if isinstance(v, (int, float)):
+                    metrics[k] = float(v)
+                else:
+                    metrics[k] = v
+        except Exception:
+            pass
+
+        try:
+            if eval_ds is not None and len(eval_ds) > 0:
+                eval_metrics = trainer.evaluate()
+                for k, v in eval_metrics.items():
+                    if isinstance(v, (int, float)):
+                        metrics[k] = float(v)
+                    else:
+                        metrics[k] = v
+        except Exception:
+            pass
+
+        note = "Real training run completed."
+        if config.finetune_method == "QLoRA" and device_name != "cuda":
+            note = "QLoRA requested, but this device is not CUDA; fell back to LoRA."
+
+        return TrainResult(
+            success=True,
+            message="Training completed successfully.",
+            output_dir=config.output_dir,
+            model_name=config.base_model,
+            finetune_method=effective_method,
+            num_train_samples=len(train_ds),
+            num_eval_samples=len(eval_ds) if eval_ds is not None else 0,
+            loss_history=loss_callback.loss_history,
+            metrics=metrics,
+            note=note,
+        )
+
+    except Exception as e:
+        return TrainResult(
             success=False,
             message=f"Training failed: {e}",
-            output_dir=str(output_dir),
-            log_path=str(log_path),
-            metrics_path=str(metrics_path),
-            checkpoint_dir=str(ckpt_dir),
-            loss_history=loss_history,
+            output_dir=config.output_dir,
+            model_name=config.base_model,
+            finetune_method=config.finetune_method,
+            loss_history=[],
+            metrics={},
+            note="See exception details in message.",
         )
 
 
-# ----------------------------
-# Example usage
-# ----------------------------
-# if __name__ == "__main__":
-#     form_data = {
-#         "base_model": "Qwen2.5-0.5B",
-#         "dataset_path": "./data/demo_dataset.jsonl",
-#         "finetune_method": "LoRA",
-#         "output_dir": "./outputs/finetuned_model",
-#         "learning_rate": 2e-4,
-#         "batch_size": 4,
-#         "epochs": 3,
-#         "lora_rank": 8,
-#         "max_length": 512,
-#     }
+# ------------------------------------------------------------
+# Real evaluation
+# ------------------------------------------------------------
+def _load_model_for_generation(
+    base_model: str,
+    model_path: str,
+):
+    _ensure_dependencies()
+    if AutoTokenizer is None or AutoModelForCausalLM is None:
+        raise RuntimeError("transformers is not available.")
 
-#     config = build_train_config(form_data)
-#     result = start_training(config)
-#     print(result)
+    device, dtype, device_name = detect_device()
+    base_model_id = normalize_model_name(base_model)
+    model_path = resolve_local_model_path(model_path)
+    model_dir = Path(model_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_id,
+        cache_dir=str(CACHE_DIR),
+        use_fast=True,
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+
+    load_kwargs: Dict[str, Any] = {
+        "cache_dir": str(CACHE_DIR),
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if device_name in {"cuda", "mps"} and dtype is not None:
+        load_kwargs["torch_dtype"] = dtype
+
+    if model_dir.exists() and (model_dir / "adapter_config.json").exists():
+        if PeftModel is None:
+            raise RuntimeError("peft is required to load LoRA adapter checkpoints.")
+        base_model_obj = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
+        model = PeftModel.from_pretrained(base_model_obj, str(model_dir))
+    elif model_dir.exists() and (model_dir / "config.json").exists():
+        model = AutoModelForCausalLM.from_pretrained(str(model_dir), **load_kwargs)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
+
+    if device is not None:
+        model.to(device)
+
+    model.eval()
+    return model, tokenizer, device_name
+
+
+def _generate_prediction(
+    model,
+    tokenizer,
+    instruction: str,
+    input_text: str,
+    template: str,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_new_tokens: int,
+    repetition_penalty: float,
+    do_sample: bool,
+    num_beams: int,
+    seed: int,
+) -> Tuple[str, str]:
+    prompt = build_generation_prompt(instruction, input_text, template=template)
+
+    if set_seed is not None:
+        set_seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    gen_kwargs: Dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "repetition_penalty": repetition_penalty,
+        "num_beams": num_beams,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
+
+    if do_sample:
+        gen_kwargs.update(
+            {
+                "do_sample": True,
+                "temperature": max(temperature, 1e-5),
+                "top_p": top_p,
+                "top_k": top_k,
+            }
+        )
+    else:
+        gen_kwargs["do_sample"] = False
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, **gen_kwargs)
+
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    if decoded.startswith(prompt):
+        prediction = decoded[len(prompt):].strip()
+    else:
+        prediction = decoded.strip()
+
+    return prompt, prediction
+
+
+def evaluate_dataset_split(
+    split_path: str,
+    base_model: str,
+    model_path: str,
+    template: str = "alpaca",
+    max_eval_samples: int = 20,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 50,
+    max_new_tokens: int = 256,
+    repetition_penalty: float = 1.05,
+    do_sample: bool = True,
+    num_beams: int = 1,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    path = Path(split_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Split file not found: {split_path}")
+
+    records = _read_jsonl(path)
+    if not records:
+        raise ValueError(f"Split file is empty: {split_path}")
+
+    evaluated_records = records[: max(1, max_eval_samples)]
+    model, tokenizer, device_name = _load_model_for_generation(base_model, model_path)
+
+    examples: List[Dict[str, Any]] = []
+    exact_match_count = 0
+    token_acc_total = 0.0
+    pred_len_total = 0.0
+    ref_len_total = 0.0
+
+    for idx, sample in enumerate(evaluated_records):
+        instruction = _normalize_text(sample.get("instruction"))
+        input_text = _normalize_text(sample.get("input"))
+        reference = _normalize_text(sample.get("output"))
+
+        prompt, prediction = _generate_prediction(
+            model=model,
+            tokenizer=tokenizer,
+            instruction=instruction,
+            input_text=input_text,
+            template=template,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+            do_sample=do_sample,
+            num_beams=num_beams,
+            seed=seed + idx,
+        )
+
+        em = _exact_match(reference, prediction)
+        ta = _token_accuracy(reference, prediction)
+
+        exact_match_count += int(em)
+        token_acc_total += ta
+        pred_len_total += len(_tokenize_for_metric(prediction))
+        ref_len_total += len(_tokenize_for_metric(reference))
+
+        examples.append(
+            {
+                "index": idx,
+                "instruction": instruction,
+                "input": input_text,
+                "reference": reference,
+                "prediction": prediction,
+                "exact_match": em,
+                "token_accuracy": round(ta, 4),
+                "prediction_length": len(_tokenize_for_metric(prediction)),
+                "reference_length": len(_tokenize_for_metric(reference)),
+                "prompt": prompt,
+            }
+        )
+
+    n = len(evaluated_records)
+    metrics = {
+        "exact_match_accuracy": round(exact_match_count / max(n, 1), 4),
+        "token_accuracy": round(token_acc_total / max(n, 1), 4),
+        "avg_prediction_length": round(pred_len_total / max(n, 1), 2),
+        "avg_reference_length": round(ref_len_total / max(n, 1), 2),
+        "evaluated_samples": n,
+        "device": device_name,
+    }
+
+    return {
+        "success": True,
+        "split_name": path.stem,
+        "total_split_samples": len(records),
+        "evaluated_samples": n,
+        "truncated": len(evaluated_records) < len(records),
+        "metrics": metrics,
+        "examples": examples,
+        "message": "Evaluation completed successfully.",
+        "generation_config": {
+            "template": template,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_new_tokens": max_new_tokens,
+            "repetition_penalty": repetition_penalty,
+            "do_sample": do_sample,
+            "num_beams": num_beams,
+            "seed": seed,
+            "max_eval_samples": max_eval_samples,
+        },
+        "model": {
+            "base_model": base_model,
+            "model_path": model_path,
+        },
+    }
+
+
+# ------------------------------------------------------------
+# Assistant chat
+# ------------------------------------------------------------
+
+def _download_assistant_model_if_needed() -> str:
+    """
+    Return a usable local path for the assistant model.
+    Priority:
+    1) ASSISTANT_MODEL_PATH if it exists locally
+    2) Download ASSISTANT_MODEL_ID into models_cache
+    """
+    resolved = resolve_local_model_path(ASSISTANT_MODEL_PATH)
+    p = Path(resolved)
+
+    if p.exists() and (
+        (p / "config.json").exists()
+        or (p / "model.safetensors").exists()
+        or (p / "pytorch_model.bin").exists()
+        or (p / "adapter_config.json").exists()
+    ):
+        return str(p)
+
+    if snapshot_download is None:
+        raise RuntimeError(
+            "huggingface_hub is required to download the assistant model automatically."
+        )
+
+    local_dir = CACHE_DIR / "models--Qwen--Qwen2.5-0.5B-Instruct"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    downloaded_path = snapshot_download(
+        repo_id=ASSISTANT_MODEL_ID,
+        local_dir=str(local_dir),
+        local_dir_use_symlinks=False,
+    )
+    return resolve_local_model_path(downloaded_path)
+
+
+def load_assistant_model():
+    _ensure_dependencies()
+
+    if AutoTokenizer is None or AutoModelForCausalLM is None:
+        raise RuntimeError("transformers is not available.")
+
+    device, dtype, device_name = detect_device()
+
+    resolved = _download_assistant_model_if_needed()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolved,
+        trust_remote_code=True,
+        use_fast=True,
+        local_files_only=False,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+
+    load_kwargs: Dict[str, Any] = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "local_files_only": False,
+    }
+    if device_name in {"cuda", "mps"} and dtype is not None:
+        load_kwargs["torch_dtype"] = dtype
+
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved,
+        **load_kwargs,
+    )
+
+    if device is not None:
+        model.to(device)
+
+    model.eval()
+    return model, tokenizer, device_name, resolved
+
+
+def chat_with_assistant(
+    messages: List[Dict[str, str]],
+    evaluation_context: Dict[str, Any] | None = None,
+    max_new_tokens: int = 256,
+) -> Dict[str, Any]:
+    model, tokenizer, device_name, resolved_path = load_assistant_model()
+
+    if evaluation_context is None:
+        evaluation_context = {}
+
+    chat_messages = build_chat_messages_from_context(
+        question=messages[-1]["content"] if messages else "",
+        evaluation_context=evaluation_context,
+    )
+
+    # If frontend sends the full history, fold it in before the final question.
+    # We keep the last user message as the current question, and summarize the rest
+    # through the evaluation_context to avoid huge prompts.
+    if messages:
+        last_user = messages[-1]
+        if last_user.get("role") == "user":
+            chat_messages[-1] = {
+                "role": "user",
+                "content": (
+                    f"Evaluation context:\n{json.dumps(evaluation_context, ensure_ascii=False, indent=2)}\n\n"
+                    f"User question:\n{last_user.get('content', '')}"
+                ),
+            }
+
+    prompt = tokenizer.apply_chat_template(
+        chat_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.3,
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.05,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    answer = decoded[len(prompt):].strip() if decoded.startswith(prompt) else decoded.strip()
+
+    return {
+        "success": True,
+        "answer": answer,
+        "device": device_name,
+        "assistant_model": resolved_path,
+    }
