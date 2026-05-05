@@ -46,8 +46,8 @@ It is designed to be **reproducible, modular, and easy to run**.
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
-cd <repo-name>
+git clone https://github.com/RayanYe/LLM-SFT-Platform.git
+cd LLM-SFT-Platform
 ```
 
 ### 2. Create environment
